@@ -25,10 +25,20 @@
 
 #define DEFSERIALQSIZE 32
 
+struct if_serial_shared {
+    char *device;               /* Serial device */
+    int baud;                   /* baud rate of device */
+    int done;                   /* Should we terminate? */
+    time_t retry;               /* retry interval */
+    pthread_mutex_t s_mutex;    /* For synchronisation of reader and writer */
+    pthread_cond_t  fv;         /* For synchronisation */
+};
+
 struct if_serial {
     int fd;
+    int saved;                  /* Are stored terminal settings valid? */
     char *slavename;            /* link to pty slave (if it exists) */
-    int saved;                  /* Are stored terminal settins valid? */
+    struct if_serial_shared *shared;
     struct termios otermios;    /* To restore previous interface settings
                                  *  on exit */
 };
@@ -49,14 +59,11 @@ void *ifdup_serial(void *ifs)
 
     oldif = (struct if_serial *) ifs;
 
-    if ((newif->fd=dup(oldif->fd)) <0) {
-        free(newif);
-        return(NULL);
-    }
-
+    newif->fd=oldif->fd;
     newif->slavename=oldif->slavename;
     newif->saved=oldif->saved;
     memcpy(&newif->otermios,&oldif->otermios,sizeof(struct termios));
+    newif->shared=oldif->shared;
     return((void *)newif);
 }
 
@@ -69,7 +76,14 @@ void cleanup_serial(iface_t *ifa)
 {
     struct if_serial *ifs = (struct if_serial *)ifa->info;
 
+    if (ifs->shared)
+        (void)  pthread_mutex_unlock(&ifs->shared->s_mutex);
+
     if (!ifa->pair) {
+        if (ifs->shared) {
+            free(ifs->shared->device);
+            free(ifs->shared);
+        }
         if (ifs->saved) {
             if (tcsetattr(ifs->fd,TCSAFLUSH,&ifs->otermios) < 0) {
                 if (ifa->type != PTY || errno != EIO)
@@ -95,9 +109,10 @@ int ttyopen(char *device, enum iotype direction)
     int dev,flags;
     struct stat sbuf;
 
+    errno = 0;
+
     /* Check if device exists and is a character special device */
     if (stat(device,&sbuf) < 0) {
-        logerr(errno,"Could not stat %s",device);
         return(-1);
     }
 
@@ -109,7 +124,6 @@ int ttyopen(char *device, enum iotype direction)
     /* Open device (RW for now..let's ignore direction...) */
     if ((dev=open(device,
         ((direction == OUT)?O_WRONLY:(direction == IN)?O_RDONLY:O_RDWR)|O_NOCTTY|O_NONBLOCK)) < 0) {
-        logerr(errno,"Failed to open %s",device);
         return(-1);
     }
 
@@ -131,6 +145,8 @@ int ttyopen(char *device, enum iotype direction)
 int ttysetup(int dev,struct termios *otermios_p, int baud, int st)
 {
     struct termios ttermios,ntermios;
+
+    errno = 0;
 
     /* Get existing terminal attributes and save them */
     if (tcgetattr(dev,otermios_p) < 0) {
@@ -276,6 +292,73 @@ void write_serial(struct iface *ifa)
     iface_thread_exit(errno);
 }
 
+/* For persistent interfaces which couldn't connect on startup, keep trying to
+ * open the device
+ * Args: pointer to interface
+ * Returns: Nothing. Never returns in fact: calls read or write methods
+ */
+
+void delayed_serial_open(iface_t *ifa)
+{
+    struct if_serial *ifs = (struct if_serial *)ifa->info;
+    struct if_serial *ifp;
+
+    pthread_mutex_lock(&ifs->shared->s_mutex);
+    if (ifs->shared->done) {
+        pthread_mutex_unlock(&ifs->shared->s_mutex);
+        DEBUG(3,"%s exiting (pair done)",ifa->name);
+        iface_thread_exit(0);
+    }
+
+    while (ifs->fd < 0) {
+        mysleep(ifs->shared->retry);
+        if ((ifs->fd=ttyopen(ifs->shared->device,
+                (ifa->pair)?BOTH:ifa->direction)) < 0){
+            if (!(errno == ENOENT || errno == ENXIO)) {
+                ifs->shared->done++;
+                pthread_mutex_unlock(&ifs->shared->s_mutex);
+                DEBUG(3,"failed to open %s:%s exiting", ifs->shared->device,
+                        strerror(errno));
+                iface_thread_exit(errno);
+            }
+            DEBUG(5,"failed to open %s:%s (retrying)",
+                    ifs->shared->device,strerror(errno));
+            continue;
+        }
+        DEBUG(3,"%s delayed open of %s succeeded",ifa->name,
+                ifs->shared->device);
+
+        if (ttysetup(ifs->fd,&ifs->otermios,ifs->shared->baud,0) < 0) {
+            logerr(errno,"Failed to set up serial line");
+            if (!(errno == EBADF || errno == EINTR)) {
+                ifs->shared->done++;
+                pthread_mutex_unlock(&ifs->shared->s_mutex);
+                iface_thread_exit(errno);
+            }
+            DEBUG(3,"Failed to set up device %s: %s (retrying open)",
+                    ifs->shared->device,strerror(errno));
+            close(ifs->fd);
+            continue;
+        }
+
+        ++ifs->saved;
+
+        if (ifa->pair) {
+            ifp=(struct if_serial *) ifa->pair->info;
+            ifp->fd = ifs->fd;
+            ifp->saved=ifs->saved;
+            memcpy(&ifp->otermios,&ifs->otermios,sizeof(struct termios));
+        }
+    }
+    pthread_mutex_unlock(&ifs->shared->s_mutex);
+
+    if (ifa->direction == IN) {
+        do_read(ifa);
+    } else {
+        write_serial(ifa);
+    }
+}
+
 /*
  * Initialise a serial interface for nmea 0183 data
  * Args: interface specification string and pointer to interface structure
@@ -283,11 +366,13 @@ void write_serial(struct iface *ifa)
  */
 struct iface *init_serial (struct iface *ifa)
 {
-    char *devname;
+    char *devname=NULL; /* Serial device to open */
+    char *eptr;         /* Used in option processing (strtol()) */
     struct if_serial *ifs;
-    int baud=B4800;        /* Default for NMEA 0183. AIS will need
+    int baud=B4800;     /* Default for NMEA 0183. AIS will need
                    explicit baud rate specification */
     int ret;
+    long retry=10;    /* Retry time for persistent interfaces */
     struct kopts *opt;
     int qsize=DEFSERIALQSIZE;
     
@@ -308,7 +393,21 @@ struct iface *init_serial (struct iface *ifa)
             else if (!strcmp(opt->val,"115200"))
                 baud=B115200;
             else {
-                logerr(0,"Unsupported baud rate \'%s\' in interface specification '\%s\'",opt->val,devname);
+                logerr(0,"Unsupported baud rate \'%s\'",opt->val);
+                return(NULL);
+            }
+        } else if (!strcasecmp(opt->var,"retry")) {
+            if (!flag_test(ifa,F_PERSIST)) {
+                logerr(0,"retry valid only valid with persist option");
+                return(NULL);
+            }
+            errno=0;
+            if ((retry=strtol(opt->val,&eptr,0)) == 0 || (errno)) {
+                logerr(0,"retry value %s out of range",opt->val);
+                return(NULL);
+            }
+            if (*eptr != '\0') {
+                logerr(0,"Invalid retry value %s",opt->val);
                 return(NULL);
             }
         } else if (!strcasecmp(opt->var,"qsize")) {
@@ -322,38 +421,86 @@ struct iface *init_serial (struct iface *ifa)
         }
     }
 
+    if (devname == NULL) {
+        logerr(0,"Must specify a serial device for serial interfaces");
+        return(NULL);
+    }
+
     /* Allocate serial specific data storage */
     if ((ifs = malloc(sizeof(struct if_serial))) == NULL) {
         logerr(errno,"Could not allocate memory");
         return(NULL);
     }
 
+    if (flag_test(ifa,F_PERSIST)) {
+        if ((ifs->shared = malloc(sizeof(struct if_serial_shared))) == NULL) {
+            logerr(errno,"Could not allocate memory");
+            return(NULL);
+        }
+        ifs->shared->baud = baud;
+        if ((ifs->shared->device=strdup(devname)) == NULL) {
+            logerr(errno,"Could not allocate memory");
+            return(NULL);
+        }
+        if (pthread_mutex_init(&ifs->shared->s_mutex,NULL) != 0) {
+            logerr(errno,"serial mutex initialisation failed");
+            return(NULL);
+        }
+
+        if (pthread_cond_init(&ifs->shared->fv,NULL) != 0) {
+            logerr(errno,"serial condition variable initialisation failed");
+            return(NULL);
+        }
+
+        ifs->shared->retry=retry;
+        if (ifs->shared->retry != retry) {
+            logerr(0,"retry value out of range");
+            return(NULL);
+        }
+        ifs->shared->baud=baud;
+        ifs->shared->done=0;
+    }
+
     /* Open interface or die */
     if ((ifs->fd=ttyopen(devname,ifa->direction)) < 0) {
-        return(NULL);
+        if (flag_test(ifa,F_IPERSIST) && (errno == ENOENT || errno == ENXIO)){
+            DEBUG(3,"Failed to open serial device %s for %s: %s (retrying in %ds)",
+                devname,(ifa->direction==IN)?"input":
+                (ifa->direction==OUT)?"output": "input/output",strerror(errno),
+                retry);
+        
+        } else {
+            logerr(errno,"Failed to open %s",devname);
+            return(NULL);
+        }
+    } else {
+        DEBUG(3,"%s: opened serial device %s for %s",ifa->name,devname,
+                (ifa->direction==IN)?"input":(ifa->direction==OUT)?"output":
+                "input/output");
     }
-    DEBUG(3,"%s: opened serial device %s for %s",ifa->name,devname,
-            (ifa->direction==IN)?"input":(ifa->direction==OUT)?"output":
-            "input/output");
 
     free_options(ifa->options);
 
-    /* Set up interface or die */
-    if ((ret = ttysetup(ifs->fd,&ifs->otermios,baud,0)) < 0) {
-        if (ret == -1) {
-            if (tcsetattr(ifs->fd,TCSANOW,&ifs->otermios) < 0) {
-                logerr(errno,"Failed to reset serial line");
+    if (ifs->fd < 0) {
+        ifa->read=delayed_serial_open;
+        ifa->read=delayed_serial_open;
+    } else {
+        /* Set up interface or die */
+        if ((ret = ttysetup(ifs->fd,&ifs->otermios,baud,0)) < 0) {
+            if (ret == -1) {
+                if (tcsetattr(ifs->fd,TCSANOW,&ifs->otermios) < 0) {
+                    logerr(errno,"Failed to reset serial line");
+                }
             }
+            return(NULL);
         }
-        return(NULL);
+        ifs->saved=1;
+        ifa->read=do_read;
+        ifa->write=write_serial;
     }
-    ifs->saved=1;
-    ifs->slavename=NULL;
 
-    /* Assign pointers to read, write and cleanup routines */
-    ifa->read=do_read;
     ifa->readbuf=read_serial;
-    ifa->write=write_serial;
+    ifs->slavename=NULL;
     ifa->cleanup=cleanup_serial;
 
     /* Allocate queue for outbound interfaces */

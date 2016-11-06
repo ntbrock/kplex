@@ -498,6 +498,12 @@ void write_tcp(struct iface *ifa)
     iface_thread_exit(errno);
 }
 
+/* For persistent interfaces which couldn't connect on startup, keep
+ * trying to connect
+ * Args: pointer to interface
+ * Returns: Nothing: Calls read or write which never returns
+ */
+
 void delayed_connect(iface_t *ifa)
 {
     struct if_tcp *ift = (struct if_tcp *) ifa->info;
