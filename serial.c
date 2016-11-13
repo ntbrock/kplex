@@ -29,6 +29,8 @@ struct if_serial_shared {
     char *device;               /* Serial device */
     int baud;                   /* baud rate of device */
     int done;                   /* Should we terminate? */
+    int critical;               /* flag for critical region processing */
+    int fixing;                 /* flag to indicate we're re-opening device */
     time_t retry;               /* retry interval */
     pthread_mutex_t s_mutex;    /* For synchronisation of reader and writer */
     pthread_cond_t  fv;         /* For synchronisation */
@@ -209,6 +211,50 @@ int ttysetup(int dev,struct termios *otermios_p, int baud, int st)
     return(0);
 }
 
+int reopen_serial(iface_t *ifa)
+{
+    struct if_serial *ifs = (struct if_serial *) ifa->info;
+
+    DEBUG(3,"%s: Reconnecting interface",ifa->name);
+    
+    /* ifs->shared->s_mutex should be locked by the calling routine */
+
+    for (;;) {
+        (void) close(ifs->fd);
+        mysleep(ifs->shared->retry);
+        if ((ifs->fd=ttyopen(ifs->shared->device,
+                (ifa->pair)?BOTH:ifa->direction)) < 0){
+            if (!(errno == ENOENT || errno == ENXIO)) {
+                ifs->shared->done++;
+                DEBUG(3,"failed to open %s:%s", ifs->shared->device,
+                        strerror(errno));
+                return(-1);
+            }
+            DEBUG(5,"failed to open %s:%s (retrying)",
+                    ifs->shared->device,strerror(errno));
+            continue;
+        }
+        DEBUG(3,"%s delayed open of %s succeeded",ifa->name,
+                ifs->shared->device);
+
+        if (ttysetup(ifs->fd,&ifs->otermios,ifs->shared->baud,0) < 0) {
+            logerr(errno,"Failed to set up serial line");
+            if (!(errno == EBADF || errno == EINTR)) {
+                ifs->shared->done++;
+                return(-1);
+            }
+            DEBUG(3,"%s: Failed to set up device %s: %s (retrying open)",
+                    ifa->name,ifs->shared->device,strerror(errno));
+            close(ifs->fd);
+            continue;
+        } else {
+            DEBUG(3,"%s: Re-Initialised %s",ifa->name,ifs->shared->device);
+            break;
+        }
+    }
+    return 0;
+} 
+
 /*
  * Read from a serial interface
  * Args: pointer to interface structure pointer to buffer
@@ -217,7 +263,63 @@ int ttysetup(int dev,struct termios *otermios_p, int baud, int st)
 ssize_t read_serial(struct iface *ifa, char *buf)
 {
     struct if_serial *ifs = (struct if_serial *) ifa->info;
-    return(read(ifs->fd,buf,BUFSIZ));
+    ssize_t nread;
+    int done=0;
+
+    for (nread=0;nread<=0;) {
+        if (flag_test(ifa,F_PERSIST)) {
+            pthread_mutex_lock(&ifs->shared->s_mutex);
+            if (ifs->fd == -1)
+                done++;
+            else
+                ifs->shared->critical++;
+            pthread_mutex_unlock(&ifs->shared->s_mutex);
+            if (done) {
+                nread=-1;
+                break;
+            }
+        }
+
+        if ((nread=read(ifs->fd,buf,BUFSIZ)) <= 0) {
+            if (nread) {
+                    DEBUG(3,"%s: %s",ifa->name,"Read Failed");
+             } else {
+                    DEBUG(3,"%s: EOF",ifa->name);
+            }
+    
+            if (!flag_test(ifa,F_PERSIST))
+                break;
+            pthread_mutex_lock(&ifs->shared->s_mutex);
+            if (ifs->shared->fixing) {
+                pthread_cond_signal(&ifs->shared->fv);
+                pthread_cond_wait(&ifs->shared->fv,&ifs->shared->s_mutex);
+            } else {
+                if (ifs->shared->critical == 2) {
+                    ifs->shared->fixing++;
+                    (void) close(ifs->fd);
+                    pthread_cond_wait(&ifs->shared->fv,&ifs->shared->s_mutex);
+                }
+                if ((nread=reopen_serial(ifa)) < 0) {
+                    if (ifa->pair)
+                        ((struct if_serial *)ifa->pair->info)->fd=-1;
+                    logerr(errno,"failed to re-open %s",ifs->shared->device);
+                }
+                if (ifs->shared->fixing) {
+                    ifs->shared->fixing=0;
+                    pthread_cond_signal(&ifs->shared->fv);
+                }
+            }
+            ifs->shared->critical--;
+            pthread_mutex_unlock(&ifs->shared->s_mutex);
+        } else if (flag_test(ifa,F_PERSIST)) {
+            pthread_mutex_lock(&ifs->shared->s_mutex);
+            ifs->shared->critical--;
+            if (ifs->shared->fixing)
+                pthread_cond_signal(&ifs->shared->fv);
+            pthread_mutex_unlock(&ifs->shared->s_mutex);
+        }
+    }
+    return nread;
 }
 
 /*
@@ -231,6 +333,8 @@ void write_serial(struct iface *ifa)
     senblk_t *senblk_p;
     int fd=ifs->fd;
     int n=0,tlen=0;
+    int done=0;
+    int part=0;
     char *ptr;
     char *tbuf;
 
@@ -242,7 +346,7 @@ void write_serial(struct iface *ifa)
         }
     }
 
-    while(n >= 0) {
+    for (;(!done);) {
         /* NULL return from next_senblk means the queue has been shut
          * down. Time to die */
         if ((senblk_p = next_senblk(ifa->q)) == NULL)
@@ -261,29 +365,75 @@ void write_serial(struct iface *ifa)
                 free(tbuf);
             }
             ptr=tbuf;
-            while(tlen) {
-                if ((n=write(fd,ptr,tlen)) < 0)
-                    break;
-                tlen-=n;
-                ptr+=n;
-            }
-            if (tlen) {
+        }
+
+        if (flag_test(ifa,F_PERSIST)) {
+            pthread_mutex_lock(&ifs->shared->s_mutex);
+            if (ifs->fd == -1)
+                done++;
+            else
+                ifs->shared->critical++;
+            pthread_mutex_unlock(&ifs->shared->s_mutex);
+            if (done) {
                 senblk_free(senblk_p,ifa->q);
                 break;
             }
         }
 
-        ptr=senblk_p->data;
-        tlen=senblk_p->len;
-        while(tlen) {
-            if ((n=write(fd,ptr,tlen)) < 0)
+        /* now write the tag, then the sentence */
+        for (;part<1;++part) {
+            while(tlen) {
+                if ((n=write(fd,ptr,tlen)) < 0) {
+                    DEBUG2(3,"%s id %x: write failed",ifa->name,ifa->id);
+                    break;
+                }
+                tlen-=n;
+                ptr+=n;
+            }
+            if (tlen) {
                 break;
-            tlen-=n;
-            ptr+=n;
+            }
+            ptr=senblk_p->data;
+            tlen=senblk_p->len;
         }
+
         senblk_free(senblk_p,ifa->q);
-        if (tlen)
-            break;
+        if (tlen) {
+            if (!flag_test(ifa,F_PERSIST)) {
+                break;
+            }
+            pthread_mutex_lock(&ifs->shared->s_mutex);
+            if (ifs->shared->fixing) {
+                pthread_cond_signal(&ifs->shared->fv);
+                pthread_cond_wait(&ifs->shared->fv,&ifs->shared->s_mutex);
+            } else {
+                if (ifs->shared->critical == 2) {
+                    ifs->shared->fixing++;
+                    (void) close(ifs->fd);
+                    pthread_cond_wait(&ifs->shared->fv,&ifs->shared->s_mutex);
+                }
+                if (reopen_serial(ifa) <  0) {
+                    if (ifa->pair)
+                        ((struct if_serial *) ifa->pair->info)->fd=-1;
+                    logerr(errno,"failed to reopen serial device");
+                    done++;
+                }
+                if (ifs->shared->fixing) {
+                    ifs->shared->fixing=0;
+                    pthread_cond_signal(&ifs->shared->fv);
+                }
+            }
+            ifs->shared->critical--;
+            pthread_mutex_unlock(&ifs->shared->s_mutex);
+            DEBUG(7,"Flushing queue interface %s",ifa->name);
+            flush_queue(ifa->q);
+        } else if (flag_test(ifa,F_PERSIST)) {
+            pthread_mutex_lock(&ifs->shared->s_mutex);
+            ifs->shared->critical--;
+            if (ifs->shared->fixing)
+                pthread_cond_signal(&ifs->shared->fv);
+            pthread_mutex_unlock(&ifs->shared->s_mutex);
+        }
     }
 
     if (ifa->tagflags)
@@ -437,7 +587,6 @@ struct iface *init_serial (struct iface *ifa)
             logerr(errno,"Could not allocate memory");
             return(NULL);
         }
-        ifs->shared->baud = baud;
         if ((ifs->shared->device=strdup(devname)) == NULL) {
             logerr(errno,"Could not allocate memory");
             return(NULL);
@@ -451,7 +600,6 @@ struct iface *init_serial (struct iface *ifa)
             logerr(errno,"serial condition variable initialisation failed");
             return(NULL);
         }
-
         ifs->shared->retry=retry;
         if (ifs->shared->retry != retry) {
             logerr(0,"retry value out of range");
@@ -459,6 +607,8 @@ struct iface *init_serial (struct iface *ifa)
         }
         ifs->shared->baud=baud;
         ifs->shared->done=0;
+        ifs->shared->critical=0;
+        ifs->shared->fixing=0;
     }
 
     /* Open interface or die */
@@ -483,7 +633,7 @@ struct iface *init_serial (struct iface *ifa)
 
     if (ifs->fd < 0) {
         ifa->read=delayed_serial_open;
-        ifa->read=delayed_serial_open;
+        ifa->write=delayed_serial_open;
     } else {
         /* Set up interface or die */
         if ((ret = ttysetup(ifs->fd,&ifs->otermios,baud,0)) < 0) {
