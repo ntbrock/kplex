@@ -1,9 +1,11 @@
-v1.3.5:
+v1.4
 * Fixed crash with checksumming enabled
 * Various queue length changes
 * Changed default input processing to "loose" for file interfaces
 * Minor change to how default values for "strict" applied
 * Fixed possible null pointer exception in serial interface argument processing
+* Add persistent behaviour for serial interfaces
+* Minor changes to persistent tcp behaviour
 
 v1.3.4: June 26th 2016
 * Fixed bug with optional interfaces
