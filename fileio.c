@@ -16,8 +16,11 @@
 
 struct if_file {
     int fd;
+    int isfifo;
+    off_t off;
     char *filename;
     size_t qsize;
+    struct timespec retry;
 };
 
 /*
@@ -140,11 +143,23 @@ void file_read_wrapper(iface_t *ifa)
     /* Create FILE stream here to allow for non-blocking opening FIFOs */
     if (ifc->fd == -1) {
         if ((ifc->fd = open(ifc->filename,O_RDONLY)) < 0) {
-            logerr(errno,"Failed to open FIFO %s for reading\n",ifc->filename);
-            iface_thread_exit(errno);
+            if (!(flag_test(ifa,F_IPERSIST)) && errno == ENOENT) {
+                logerr(errno,"Failed to open %s for reading\n",ifc->filename);
+                iface_thread_exit(errno);
+            }
         } else {
             DEBUG(3,"%s: opened %s for reading",ifa->name,ifc->filename);
         }
+        do {
+            nanosleep(&ifc->retry,NULL);
+            if ((ifc->fd = open(ifc->filename,O_RDONLY)) < 0) {
+                if (errno != ENOENT) {
+                    logerr(errno,"Failed to open %s for reading\n",
+                            ifc->filename);
+                    iface_thread_exit(errno);
+                }
+            }
+        } while (ifc->fd == -1);
     }
     do_read(ifa);
 }
@@ -152,6 +167,7 @@ void file_read_wrapper(iface_t *ifa)
 ssize_t read_file(iface_t *ifa, char *buf)
 {
     struct if_file *ifc = (struct if_file *) ifa->info;
+    struct stat sb;
     ssize_t nread;
 
     for(;;) {
@@ -159,16 +175,42 @@ ssize_t read_file(iface_t *ifa, char *buf)
             if (!flag_test(ifa,F_PERSIST))
                 break;
             close(ifc->fd);
-            if ((ifc->fd=open(ifc->filename,O_RDONLY)) < 0) {
-                logerr(errno,"Failed to re-open FIFO %s for reading\n",
-                            ifc->filename);
+            if (ifc->isfifo) {
+                if ((ifc->fd=open(ifc->filename,O_RDONLY)) < 0) {
+                    logerr(errno,"Failed to re-open FIFO %s for reading\n",
+                             ifc->filename);
+                    break;
+                }
+                DEBUG(4,"%s: re-opened %s for reading",ifa->name,ifc->filename);
+                continue;
+            }
+            /* Regular file in tail mode */
+            do {
+                (void) usleep(10000);
+                if (stat(ifc->filename,&sb) < 0) {
+                    logerr(errno,"Failed to stat %s",ifc->filename);
+                    break;
+                }
+            } while(sb.st_size == ifc->off); 
+            if (sb.st_size < ifc->off) {
+                logerr(0,"%s shrunk! (exiting)",ifc->filename);
                 break;
             }
-            DEBUG(4,"%s: re-opened %s for reading",ifa->name,ifc->filename);
-            continue;
+            if ((ifc->fd=open(ifc->filename,O_RDONLY)) < 0) {
+                logerr(errno,"Failed to re-open %s for reading",ifc->filename);
+                break;
+            }
+            if (lseek(ifc->fd,ifc->off,SEEK_SET) < 0) {
+                printf("off is %lld\n",ifc->off);
+                logerr(errno,"Lost position in %s for reading",ifc->filename);
+                close(ifc->fd);
+                break;
+            }
+            continue;       
         } else
             break;
     }
+    ifc->off+=nread;
     return nread;
 }
 
@@ -177,6 +219,7 @@ iface_t *init_file (iface_t *ifa)
     struct if_file *ifc;
     struct kopts *opt;
     struct stat statbuf;
+    unsigned long retry = 1;
     int ret;
     int append=0;
     uid_t uid=-1;
@@ -185,6 +228,7 @@ iface_t *init_file (iface_t *ifa)
     struct group *group;
     mode_t tperm,perm=0;
     char *cp;
+    char *eptr=NULL;
 
     if ((ifc = (struct if_file *)malloc(sizeof(struct if_file))) == NULL) {
         logerr(errno,"Could not allocate memory");
@@ -196,6 +240,8 @@ iface_t *init_file (iface_t *ifa)
     ifc->qsize=DEFQSIZE;
     ifc->fd=-1;
     ifa->info = (void *) ifc;
+    ifc->off=0;
+    ifc->isfifo=0;
 
     for(opt=ifa->options;opt;opt=opt->next) {
         if (!strcasecmp(opt->var,"filename")) {
@@ -246,11 +292,28 @@ iface_t *init_file (iface_t *ifa)
                 logerr(0,"Invalid permissions for tty device \'%s\'",opt->val);
                 return 0;
             }
+        } else if (!strcasecmp(opt->var,"retry")) {
+            if (!flag_test(ifa,F_PERSIST)) {
+                logerr(0,"retry valid only valid with persist option");
+                return(NULL);
+            }
+            errno=0;
+            if ((retry=strtol(opt->val,&eptr,0)) == 0 || (errno)) {
+                logerr(0,"retry value %s out of range",opt->val);
+                return(NULL);
+            }
+            if (*eptr != '\0') {
+                logerr(0,"Invalid retry value %s",opt->val);
+                return(NULL);
+            }
         } else {
             logerr(0,"Unknown interface option %s\n",opt->var);
             return(NULL);
         }
     }
+
+    ifc->retry.tv_sec=retry/1000;
+    ifc->retry.tv_nsec=(retry%1000)*1000000;
 
     /* We do allow use of stdin and stdout, but not if they're connected to
      * a terminal. This allows re-direction in background mode
@@ -285,7 +348,7 @@ iface_t *init_file (iface_t *ifa)
         }
 
         if ((ret=stat(ifc->filename,&statbuf)) < 0) {
-            if (ifa->direction != OUT) {
+            if (ifa->direction != OUT && (!flag_test(ifa,F_IPERSIST))) {
                 logerr(errno,"stat %s",ifc->filename);
                 return(NULL);
             }
@@ -299,9 +362,10 @@ iface_t *init_file (iface_t *ifa)
                 logerr(errno,"Could not access %s",ifc->filename);
                 return(NULL);
             }
+            ++ifc->isfifo;
         } else {
-            if (flag_test(ifa,F_PERSIST)) {
-                logerr(0,"Can't use persist mode on %s: Not a FIFO",
+            if (flag_test(ifa,F_PERSIST) && ifa->direction==OUT) {
+                logerr(0,"Can't use persist mode on %s: Output and Not a FIFO",
                         ifc->filename);
                 return(NULL);
             }
@@ -327,7 +391,8 @@ iface_t *init_file (iface_t *ifa)
                 }
                 /* file is for input or already exists */
                 if ((ifc->fd=open(ifc->filename,(ifa->direction==IN)?O_RDONLY:
-                        (O_WRONLY|((append)?O_APPEND:O_TRUNC)))) < 0) {
+                        (O_WRONLY|((append)?O_APPEND:O_TRUNC)))) < 0 &&
+                        (!(errno == ENOENT && (flag_test(ifa,F_IPERSIST))))) {
                     logerr(errno,"Failed to open file %s",ifc->filename);
                     return(NULL);
                 }
