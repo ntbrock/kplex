@@ -82,7 +82,7 @@ disables looking for the default configuration files.
     <varable>=<value>
 These correspond to configuration options which may otherwise be specified in
 "global" section of the configuration file (discussed in the "Configuration
-File" secction below).  Command line configuration options always override
+File" section below).  Command line configuration options always override
 options given in the configuration file.
 
 <interface> is an interface specifier which takes the form:
@@ -219,6 +219,7 @@ standard input and standard output.
     Interface-specific options:
         filename=<file>
         persist=[yes|no]
+        retry=[yes|no]
         append=[yes|no]
         eol=[rn|n]
         owner=<user>
@@ -261,11 +262,20 @@ output is appended to the file.  If "append=no" (the default) is specified, the
 file will be truncated before output is written.  This option may not be
 specified for input files, FIFOs or terminals.
 
-"persist=yes" may only be specified on an interface connected to a FIFO. If
-specified it will re-open a FIFO when the reader or writer at the other end
-closes the pipe.  If "persist=no" (the default) is specified, an input interface
-will exit on receipt of EOF. An output interface will exit when the reader at
-the other end of the pipe exits.
+"persist=yes" may be specified for an input other than stdin or any interface
+connected to a FIFO. If specified for a regular file input, the interface will
+behaviour similarly to the tail(1) utility. On reaching the end of a file it
+will close it but check every <retry> milliseconds to see whether the file has
+increased in size. If it has it will re-open the file and start reading new data
+from the point it previously finished.  If "persist=fromstart" is specified,
+kplex will continue to try opening an input file every <retry> milliseconds even
+if it doesn't exist when kplex starts up.
+
+If "persist=yes" is specified for a FIFO it will re-open it when the reader
+or writer at the other end closes the pipe.  If "persist=no" (the default) is
+specified, an input interface will exit on receipt of EOF. An output interface
+connected to a FIFO will exit when the reader at the other end of the pipe
+exits.
 
 FIFOs block on open for read until something opens the FIFO for writing, and
 block on open for write until something opens them for reading.  To avoid

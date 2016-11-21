@@ -6,6 +6,7 @@ v1.4
 * Fixed possible null pointer exception in serial interface argument processing
 * Add persistent behaviour for serial interfaces
 * Minor changes to persistent tcp behaviour
+* Added "persist" options for regular input files.
 
 v1.3.4: June 26th 2016
 * Fixed bug with optional interfaces

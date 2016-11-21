@@ -169,6 +169,7 @@ ssize_t read_file(iface_t *ifa, char *buf)
     struct if_file *ifc = (struct if_file *) ifa->info;
     struct stat sb;
     ssize_t nread;
+    int ret;
 
     for(;;) {
         if ((nread=read(ifc->fd,buf,BUFSIZ)) <=0) {
@@ -184,14 +185,19 @@ ssize_t read_file(iface_t *ifa, char *buf)
                 DEBUG(4,"%s: re-opened %s for reading",ifa->name,ifc->filename);
                 continue;
             }
-            /* Regular file in tail mode */
+            /* Regular file in tail mode. Check every <retry> ms whether
+             * file has grown and re-open if it has */
             do {
-                (void) usleep(10000);
-                if (stat(ifc->filename,&sb) < 0) {
+                (void) nanosleep(&ifc->retry,NULL);
+                if ((ret = stat(ifc->filename,&sb)) < 0) {
                     logerr(errno,"Failed to stat %s",ifc->filename);
                     break;
                 }
             } while(sb.st_size == ifc->off); 
+
+            if (ret < 0)
+                break;
+
             if (sb.st_size < ifc->off) {
                 logerr(0,"%s shrunk! (exiting)",ifc->filename);
                 break;
