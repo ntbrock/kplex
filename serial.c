@@ -61,7 +61,11 @@ void *ifdup_serial(void *ifs)
 
     oldif = (struct if_serial *) ifs;
 
-    newif->fd=oldif->fd;
+    if ((newif->fd=dup(oldif->fd)) <0) {
+        free(newif);
+        return(NULL);
+    }
+
     newif->slavename=oldif->slavename;
     newif->saved=oldif->saved;
     memcpy(&newif->otermios,&oldif->otermios,sizeof(struct termios));
@@ -211,6 +215,11 @@ int ttysetup(int dev,struct termios *otermios_p, int baud, int st)
     return(0);
 }
 
+/*
+ * Re-open serial connection
+ * Args: Pointer to interface structure
+ * Returns: 0 on success, -1 otherwise
+ */
 int reopen_serial(iface_t *ifa)
 {
     struct if_serial *ifs = (struct if_serial *) ifa->info;
@@ -365,6 +374,8 @@ void write_serial(struct iface *ifa)
                 free(tbuf);
             }
             ptr=tbuf;
+        } else {
+            ++part;
         }
 
         if (flag_test(ifa,F_PERSIST)) {
@@ -381,7 +392,11 @@ void write_serial(struct iface *ifa)
         }
 
         /* now write the tag, then the sentence */
-        for (;part<1;++part) {
+        for (;part<2;++part) {
+            if (part == 1) {
+                ptr=senblk_p->data;
+                tlen=senblk_p->len;
+            }
             while(tlen) {
                 if ((n=write(fd,ptr,tlen)) < 0) {
                     DEBUG2(3,"%s id %x: write failed",ifa->name,ifa->id);
@@ -393,8 +408,6 @@ void write_serial(struct iface *ifa)
             if (tlen) {
                 break;
             }
-            ptr=senblk_p->data;
-            tlen=senblk_p->len;
         }
 
         senblk_free(senblk_p,ifa->q);
@@ -522,7 +535,7 @@ struct iface *init_serial (struct iface *ifa)
     int baud=B4800;     /* Default for NMEA 0183. AIS will need
                    explicit baud rate specification */
     int ret;
-    long retry=10;    /* Retry time for persistent interfaces */
+    unsigned long retry=10;    /* Retry time for persistent interfaces */
     struct kopts *opt;
     int qsize=DEFSERIALQSIZE;
     
@@ -609,6 +622,8 @@ struct iface *init_serial (struct iface *ifa)
         ifs->shared->done=0;
         ifs->shared->critical=0;
         ifs->shared->fixing=0;
+    } else {
+        ifs->shared = NULL;
     }
 
     /* Open interface or die */
@@ -688,10 +703,12 @@ struct iface *init_pty (struct iface *ifa)
     struct if_serial *ifs;
     int baud=B4800,slavefd;
     int ret;
+    unsigned long retry=10;
     struct kopts *opt;
     int qsize=DEFSERIALQSIZE;
     char *master="s";
     char *cp;
+    char *eptr;         /* Used in option processing (strtol()) */
     mode_t perm = 0;
     struct passwd *owner;
     struct group *group;
@@ -756,6 +773,20 @@ struct iface *init_pty (struct iface *ifa)
                 logerr(0,"Unsupported baud rate \'%s\' in interface specification '\%s\'",opt->val,devname);
                 return(NULL);
             }
+        } else if (!strcasecmp(opt->var,"retry")) {
+            if (!flag_test(ifa,F_PERSIST)) {
+                logerr(0,"retry valid only valid with persist option");
+                return(NULL);
+            }
+            errno=0;
+            if ((retry=strtol(opt->val,&eptr,0)) == 0 || (errno)) {
+                logerr(0,"retry value %s out of range",opt->val);
+                return(NULL);
+            }
+            if (*eptr != '\0') {
+                logerr(0,"Invalid retry value %s",opt->val);
+                return(NULL);
+            }
         } else if (!strcasecmp(opt->var,"qsize")) {
             if (!(qsize=atoi(opt->val))) {
                 logerr(0,"Invalid queue size specified: %s",opt->val);
@@ -774,6 +805,41 @@ struct iface *init_pty (struct iface *ifa)
 
     ifs->saved=0;
     ifs->slavename=NULL;
+
+    if (flag_test(ifa,F_PERSIST)){
+        if (*master != 's') {
+            logerr(0,"persist mode not valid with master ptys");
+            return(NULL);
+        }
+        if ((ifs->shared = malloc(sizeof(struct if_serial_shared))) == NULL) {
+            logerr(errno,"Could not allocate memory");
+            return(NULL);
+        }
+        if ((ifs->shared->device=strdup(devname)) == NULL) {
+            logerr(errno,"Could not allocate memory");
+            return(NULL);
+        }
+        if (pthread_mutex_init(&ifs->shared->s_mutex,NULL) != 0) {
+            logerr(errno,"serial mutex initialisation failed");
+            return(NULL);
+        }
+
+        if (pthread_cond_init(&ifs->shared->fv,NULL) != 0) {
+            logerr(errno,"serial condition variable initialisation failed");
+            return(NULL);
+        }
+        ifs->shared->retry=retry;
+        if (ifs->shared->retry != retry) {
+            logerr(0,"retry value out of range");
+            return(NULL);
+        }
+        ifs->shared->baud=baud;
+        ifs->shared->done=0;
+        ifs->shared->critical=0;
+        ifs->shared->fixing=0;
+    } else {
+        ifs->shared = NULL;
+    }
 
     if (*master != 's') {
         if (openpty(&ifs->fd,&slavefd,slave,NULL,NULL) < 0) {
@@ -818,9 +884,10 @@ struct iface *init_pty (struct iface *ifa)
             if ((ifs->slavename=strdup(devname)) == NULL) {
                 logerr(errno,"Failed to save device name. Link will not be removed on exit");
             }
-        } else
-    /* No device name was given: Just print the pty name */
+        } else {
+            /* No device name was given: Just print the pty name */
             loginfo("Slave pty for output at %s baud is %s",baudstr,slave);
+        }
     } else {
     /* Slave mode: This is no different from a serial line */
         if (!devname) {
@@ -828,11 +895,22 @@ struct iface *init_pty (struct iface *ifa)
             return(NULL);
         }
         if ((ifs->fd=ttyopen(devname,ifa->direction)) < 0) {
-            return(NULL);
+            if (flag_test(ifa,F_IPERSIST) &&
+                    (errno == ENOENT || errno == ENXIO)){
+                DEBUG(3,"Failed to open serial device %s for %s: %s (retrying in %ds)",
+                        devname,(ifa->direction==IN)?"input":
+                        (ifa->direction==OUT)?"output": "input/output",
+                        strerror(errno),retry);
+
+            } else {
+                logerr(errno,"Failed to open %s",devname);
+                return(NULL);
+            }
+        } else {
+            DEBUG(3,"%s: opened pty slave %s for %s",ifa->name,devname,
+                    (ifa->direction==IN)?"input":(ifa->direction==OUT)?"output":
+                    "input/output");
         }
-        DEBUG(3,"%s: opened pty slave %s for %s",ifa->name,devname,
-                (ifa->direction==IN)?"input":(ifa->direction==OUT)?"output":
-                "input/output");
     }
 
     free_options(ifa->options);
@@ -847,9 +925,15 @@ struct iface *init_pty (struct iface *ifa)
     }
     ifs->saved=1;
 
-    ifa->read=do_read;
+    if (ifs->fd < 0) {
+        ifa->read=delayed_serial_open;
+        ifa->write=delayed_serial_open;
+    } else {
+        ifa->read=do_read;
+        ifa->write=write_serial;
+    }
+
     ifa->readbuf=read_serial;
-    ifa->write=write_serial;
     ifa->cleanup=cleanup_serial;
 
     if (ifa->direction != IN)
